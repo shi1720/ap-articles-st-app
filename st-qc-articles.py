@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 from streamlit_lottie import st_lottie
 from streamlit_extras.add_vertical_space import add_vertical_space
+import threading
 
 # Constants
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -62,51 +63,6 @@ def parallel_api_calls(prompts, api_key):
 
     return responses
 
-def process_row(row_data, course, api_key):
-    TOPIC, THEMES, OBJECTIVES, KEY_CONCEPTS, ARTICLE, QUESTIONS = row_data
-
-    prompts = [
-        generate_prompt1(ARTICLE, course),
-        generate_prompt2(ARTICLE, KEY_CONCEPTS, course),
-        generate_prompt3(ARTICLE, THEMES, OBJECTIVES, course),
-        generate_prompt4(ARTICLE, TOPIC, course),
-        generate_prompt5(ARTICLE, QUESTIONS, course),
-        generate_prompt6(ARTICLE, course),
-        generate_prompt7(ARTICLE, course)
-    ]
-
-    responses = parallel_api_calls(prompts, api_key)
-
-    all_responses = f"""
-    <evaluation_results>
-    <format_evaluation>
-        {responses[0]}
-    </format_evaluation>
-    <alignment_with_key_concepts_and_skills>
-        {responses[1]}
-    </alignment_with_key_concepts_and_skills>
-    <alignment_with_themes_and_learning_objectives>
-        {responses[2]}
-    </alignment_with_themes_and_learning_objectives>
-    <concept_formula_inclusion>
-        {responses[3]}
-    </concept_formula_inclusion>
-    <ap_question_sufficiency>
-        {responses[4]}
-    </ap_question_sufficiency>
-    <factual_accuracy>
-        {responses[5]}
-    </factual_accuracy>
-    <good_to_have_factors>
-        {responses[6]}
-    </good_to_have_factors>
-    </evaluation_results>
-    """
-
-    final_prompt = generate_final_prompt(all_responses, course)
-    final_response = call_claude_api(final_prompt, api_key)
-
-    return responses + [final_response]
 
 def generate_prompt1(ARTICLE, COURSE):
     return f"""
@@ -359,7 +315,39 @@ Important:
 
 def generate_prompt5(ARTICLE, QUESTIONS, COURSE):
     return f"""
-[Previous part of the prompt...]
+You are a highly experienced AP {COURSE} exam writer and grader with 30 years of experience. Your task is to evaluate whether an article provides sufficient information for students to respond to AP-style questions.
+
+Article to evaluate:
+<article>
+{ARTICLE}
+</article>
+
+Sample AP-style questions:
+{QUESTIONS}
+
+Please follow the instructions below carefully and thoroughly. Analyze each point step by step internally, but present only the final JSON output as specified. If you do not follow the instructions exactly, you will be penalized.
+
+Evaluation Steps:
+
+1. Question Analysis:
+   - For each AP-style question in {QUESTIONS}:
+     - Identify the key information and concepts needed to answer the question effectively.
+
+2. Content Sufficiency:
+   - Determine whether the article contains all the necessary information to answer each question fully.
+   - Check for the presence of relevant facts, concepts, explanations, and examples.
+   Definition:
+   - "Provides sufficient information to answer all given AP-style questions" means that a student could answer each question completely based solely on the content of the article.
+
+3. Depth of Knowledge (DOK) Assessment:
+   - Evaluate whether the article provides enough depth for students to respond at DOK levels 3 and 4.
+   - DOK levels 3 and 4 involve strategic thinking and extended reasoning.
+
+4. Task Verb Alignment:
+   - Assess whether the article's content allows students to perform tasks associated with AP task verbs such as "explain," "analyze," "evaluate," "compare," "justify," "synthesize."
+
+5. Additional Information Check:
+   - Identify if any crucial information is missing that would be necessary for students to fully answer the questions.
 
 Scoring Criteria:
 
@@ -554,6 +542,55 @@ Important:
 """
 
 
+def process_row(row_data, course, api_key):
+    try:
+        TOPIC, THEMES, OBJECTIVES, KEY_CONCEPTS, ARTICLE, QUESTIONS = row_data
+
+        prompts = [
+            generate_prompt1(ARTICLE, course),
+            generate_prompt2(ARTICLE, KEY_CONCEPTS, course),
+            generate_prompt3(ARTICLE, THEMES, OBJECTIVES, course),
+            generate_prompt4(ARTICLE, TOPIC, course),
+            generate_prompt5(ARTICLE, QUESTIONS, course),
+            generate_prompt6(ARTICLE, course),
+            generate_prompt7(ARTICLE, course)
+        ]
+
+        responses = parallel_api_calls(prompts, api_key)
+
+        all_responses = f"""
+        <evaluation_results>
+        <format_evaluation>
+            {responses[0]}
+        </format_evaluation>
+        <alignment_with_key_concepts_and_skills>
+            {responses[1]}
+        </alignment_with_key_concepts_and_skills>
+        <alignment_with_themes_and_learning_objectives>
+            {responses[2]}
+        </alignment_with_themes_and_learning_objectives>
+        <concept_formula_inclusion>
+            {responses[3]}
+        </concept_formula_inclusion>
+        <ap_question_sufficiency>
+            {responses[4]}
+        </ap_question_sufficiency>
+        <factual_accuracy>
+            {responses[5]}
+        </factual_accuracy>
+        <good_to_have_factors>
+            {responses[6]}
+        </good_to_have_factors>
+        </evaluation_results>
+        """
+
+        final_prompt = generate_final_prompt(all_responses, course)
+        final_response = call_claude_api(final_prompt, api_key)
+
+        return responses + [final_response]
+    except Exception as e:
+        st.error(f"Error in process_row: {str(e)}")
+        return ["NA"] * 8
 
 def get_csv_download_link(df, filename="processed_articles.csv"):
     csv = df.to_csv(index=False)
@@ -561,15 +598,35 @@ def get_csv_download_link(df, filename="processed_articles.csv"):
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download Processed CSV</a>'
     return href
 
-def process_csv(df, course, api_key):
+def process_csv(df, course, api_key, start_row, end_row, progress_bar, stop_flag, download_button):
     results = []
-    progress_bar = st.progress(0)
-    for index, row in df.iterrows():
-        row_data = row.tolist()
-        responses = process_row(row_data, course, api_key)
-        results.append(responses)
-        progress = (index + 1) / len(df)
+    for index, row in df.iloc[start_row:end_row+1].iterrows():
+        if stop_flag.is_set():
+            break
+        try:
+            row_data = row.tolist()
+            responses = process_row(row_data, course, api_key)
+            results.append(responses)
+        except Exception as e:
+            st.error(f"Error processing row {index}: {str(e)}")
+            responses = ["NA"] * 8  # Add NA for all 8 columns
+            results.append(responses)
+        
+        # Update the DataFrame after each row is processed
+        for j in range(min(7, len(responses))):
+            df.loc[index, f'Evaluation_{j+1}'] = responses[j]
+        
+        if len(responses) > 7:
+            df.loc[index, 'Final_Evaluation'] = responses[7]
+        else:
+            df.loc[index, 'Final_Evaluation'] = "NA"
+        
+        progress = (index - start_row + 1) / (end_row - start_row + 1)
         progress_bar.progress(progress)
+        
+        # Update the download button after each row
+        download_button.markdown(get_csv_download_link(df), unsafe_allow_html=True)
+    
     return results
 
 def main():
@@ -652,18 +709,38 @@ def main():
                 st.error(f"The CSV file must include these columns: {', '.join(expected_columns)}")
                 return
 
+            # Row range selection
+            col1, col2 = st.columns(2)
+            with col1:
+                start_row = st.number_input("Start Row", min_value=0, max_value=len(df)-1, value=0)
+            with col2:
+                end_row = st.number_input("End Row", min_value=start_row, max_value=len(df)-1, value=len(df)-1)
+
             if st.button("Process CSV"):
+                progress_bar = st.progress(0)
+                stop_flag = threading.Event()
+                
+                # Create placeholders for pause button and download button
+                pause_button = st.empty()
+                download_button = st.empty()
+                
+                def pause_processing():
+                    stop_flag.set()
+                    st.warning("Processing paused. You can download the CSV with processed rows so far.")
+                    # Ensure the download button is visible when paused
+                    download_button.markdown(get_csv_download_link(df), unsafe_allow_html=True)
+
+                pause_button.button("Pause Processing", on_click=pause_processing)
+
                 with st.spinner("Processing CSV..."):
-                    results = process_csv(df, course, api_key)
+                    results = process_csv(df, course, api_key, start_row, end_row, progress_bar, stop_flag, download_button)
 
-                    # Add results to the dataframe
-                    for i, result in enumerate(results):
-                        for j, response in enumerate(result[:7]):
-                            df.loc[i, f'Evaluation_{j+1}'] = response
-                        df.loc[i, 'Final_Evaluation'] = result[7]
+                if stop_flag.is_set():
+                    st.success("Processing paused. You can download the CSV with processed rows above.")
+                else:
+                    st.success("Processing completed. You can download the full CSV above.")
 
-                    st.write(df)
-                    st.markdown(get_csv_download_link(df), unsafe_allow_html=True)
+                st.write(df)
 
 if __name__ == "__main__":
     main()
