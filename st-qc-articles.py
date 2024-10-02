@@ -63,7 +63,6 @@ def parallel_api_calls(prompts, api_key):
 
     return responses
 
-
 def generate_prompt1(ARTICLE, COURSE):
     return f"""
 You are an expert AP {COURSE} educator and assessment specialist with 30 years of experience in crafting and evaluating high-quality educational content. Your task is to evaluate the format of an AP {COURSE} article critically.
@@ -542,55 +541,39 @@ Important:
 """
 
 
-def process_row(row_data, course, api_key):
-    try:
-        TOPIC, THEMES, OBJECTIVES, KEY_CONCEPTS, ARTICLE, QUESTIONS = row_data
+def process_row(row_data, course, api_key, prompt_states, edited_prompts):
+    TOPIC, THEMES, OBJECTIVES, KEY_CONCEPTS, ARTICLE, QUESTIONS = row_data
 
-        prompts = [
-            generate_prompt1(ARTICLE, course),
-            generate_prompt2(ARTICLE, KEY_CONCEPTS, course),
-            generate_prompt3(ARTICLE, THEMES, OBJECTIVES, course),
-            generate_prompt4(ARTICLE, TOPIC, course),
-            generate_prompt5(ARTICLE, QUESTIONS, course),
-            generate_prompt6(ARTICLE, course),
-            generate_prompt7(ARTICLE, course)
-        ]
+    def format_prompt(prompt_template, **kwargs):
+        for key, value in kwargs.items():
+            prompt_template = prompt_template.replace(f"{{{{{key}}}}}", str(value))
+        return prompt_template
 
-        responses = parallel_api_calls(prompts, api_key)
+    prompts = [
+        format_prompt(edited_prompts['prompt1'], ARTICLE=ARTICLE, COURSE=course) if prompt_states["prompt1"] else None,
+        format_prompt(edited_prompts['prompt2'], ARTICLE=ARTICLE, KEY_CONCEPTS=KEY_CONCEPTS, COURSE=course) if prompt_states["prompt2"] else None,
+        format_prompt(edited_prompts['prompt3'], ARTICLE=ARTICLE, THEMES=THEMES, OBJECTIVE=OBJECTIVES, COURSE=course) if prompt_states["prompt3"] else None,
+        format_prompt(edited_prompts['prompt4'], ARTICLE=ARTICLE, TOPIC=TOPIC, COURSE=course) if prompt_states["prompt4"] else None,
+        format_prompt(edited_prompts['prompt5'], ARTICLE=ARTICLE, QUESTIONS=QUESTIONS, COURSE=course) if prompt_states["prompt5"] else None,
+        format_prompt(edited_prompts['prompt6'], ARTICLE=ARTICLE, COURSE=course) if prompt_states["prompt6"] else None,
+        format_prompt(edited_prompts['prompt7'], ARTICLE=ARTICLE, COURSE=course) if prompt_states["prompt7"] else None,
+    ]
 
-        all_responses = f"""
-        <evaluation_results>
-        <format_evaluation>
-            {responses[0]}
-        </format_evaluation>
-        <alignment_with_key_concepts_and_skills>
-            {responses[1]}
-        </alignment_with_key_concepts_and_skills>
-        <alignment_with_themes_and_learning_objectives>
-            {responses[2]}
-        </alignment_with_themes_and_learning_objectives>
-        <concept_formula_inclusion>
-            {responses[3]}
-        </concept_formula_inclusion>
-        <ap_question_sufficiency>
-            {responses[4]}
-        </ap_question_sufficiency>
-        <factual_accuracy>
-            {responses[5]}
-        </factual_accuracy>
-        <good_to_have_factors>
-            {responses[6]}
-        </good_to_have_factors>
-        </evaluation_results>
-        """
+    # Filter out None values (disabled prompts)
+    prompts = [p for p in prompts if p is not None]
 
-        final_prompt = generate_final_prompt(all_responses, course)
-        final_response = call_claude_api(final_prompt, api_key)
+    responses = parallel_api_calls(prompts, api_key)
 
-        return responses + [final_response]
-    except Exception as e:
-        st.error(f"Error in process_row: {str(e)}")
-        return ["NA"] * 8
+    # Prepare all_responses
+    all_responses = "<evaluation_results>\n"
+    for i, response in enumerate(responses):
+        all_responses += f"<evaluation_{i+1}>\n{response}\n</evaluation_{i+1}>\n"
+    all_responses += "</evaluation_results>"
+
+    final_prompt = format_prompt(edited_prompts['final_prompt'], all_responses=all_responses, COURSE=course)
+    final_response = call_claude_api(final_prompt, api_key)
+
+    return responses + [final_response]
 
 def get_csv_download_link(df, filename="processed_articles.csv"):
     csv = df.to_csv(index=False)
@@ -598,28 +581,23 @@ def get_csv_download_link(df, filename="processed_articles.csv"):
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download Processed CSV</a>'
     return href
 
-def process_csv(df, course, api_key, start_row, end_row, progress_bar, stop_flag, download_button):
+def process_csv(df, course, api_key, start_row, end_row, progress_bar, stop_flag, download_button, prompt_states, edited_prompts):
     results = []
     for index, row in df.iloc[start_row:end_row+1].iterrows():
         if stop_flag.is_set():
             break
         try:
             row_data = row.tolist()
-            responses = process_row(row_data, course, api_key)
+            responses = process_row(row_data, course, api_key, prompt_states, edited_prompts)
             results.append(responses)
         except Exception as e:
             st.error(f"Error processing row {index}: {str(e)}")
-            responses = ["NA"] * 8  # Add NA for all 8 columns
-            results.append(responses)
+            results.append(["NA"] * 8)  # Add NA for all 8 columns
         
         # Update the DataFrame after each row is processed
-        for j in range(min(7, len(responses))):
-            df.loc[index, f'Evaluation_{j+1}'] = responses[j]
-        
-        if len(responses) > 7:
-            df.loc[index, 'Final_Evaluation'] = responses[7]
-        else:
-            df.loc[index, 'Final_Evaluation'] = "NA"
+        for j, response in enumerate(results[-1][:7]):
+            df.loc[index, f'Evaluation_{j+1}'] = response
+        df.loc[index, 'Final_Evaluation'] = results[-1][7]
         
         progress = (index - start_row + 1) / (end_row - start_row + 1)
         progress_bar.progress(progress)
@@ -649,13 +627,40 @@ def main():
         st.warning("Please enter your Anthropic API Key to proceed.")
         return
 
-    # Course selection (common for both input methods)
+    # Course selection
     course = st.selectbox("Select AP course", 
                           ["World History", "US History", "European History", "Human Geography", 
                            "Biology", "Chemistry", "Physics", "Environmental Science", 
                            "Calculus AB", "Calculus BC", "Statistics", 
                            "English Language", "English Literature", 
                            "Psychology", "Economics", "Government and Politics"])
+
+    # Prompt editing and enabling/disabling
+    st.header("Prompts Configuration")
+    prompt_states = {}
+    edited_prompts = {}
+
+    for i in range(1, 8):
+        st.subheader(f"Prompt {i}")
+        prompt_states[f"prompt{i}"] = st.checkbox(f"Enable Prompt {i}", value=True)
+        
+        # Adjust the function call based on the number of arguments each function expects
+        if i == 1 or i == 6 or i == 7:
+            default_prompt = globals()[f"generate_prompt{i}"]("{{ARTICLE}}", "{{COURSE}}")
+        elif i == 2:
+            default_prompt = generate_prompt2("{{ARTICLE}}", "{{KEY_CONCEPTS}}", "{{COURSE}}")
+        elif i == 3:
+            default_prompt = generate_prompt3("{{ARTICLE}}", "{{THEMES}}", "{{OBJECTIVE}}", "{{COURSE}}")
+        elif i == 4:
+            default_prompt = generate_prompt4("{{ARTICLE}}", "{{TOPIC}}", "{{COURSE}}")
+        elif i == 5:
+            default_prompt = generate_prompt5("{{ARTICLE}}", "{{QUESTIONS}}", "{{COURSE}}")
+        
+        edited_prompts[f"prompt{i}"] = st.text_area(f"Edit Prompt {i}", value=default_prompt, height=400)
+
+    st.subheader("Final Prompt")
+    default_final_prompt = generate_final_prompt("{{all_responses}}", "{{COURSE}}")
+    edited_prompts["final_prompt"] = st.text_area("Edit Final Prompt", value=default_final_prompt, height=400)
 
     # Input method selection
     input_method = st.radio("Choose input method:", ("Text Input", "CSV Upload"))
@@ -680,7 +685,7 @@ def main():
                     results = []
                     progress_bar = st.progress(0)
                     for i, a in enumerate(articles):
-                        result = process_row(a, course, api_key)
+                        result = process_row(a, course, api_key, prompt_states, edited_prompts)
                         results.append(result)
                         progress_bar.progress((i + 1) / len(articles))
 
@@ -690,11 +695,12 @@ def main():
                         st.write(f"**Topic:** {article[0]}")
                         
                         for j, response in enumerate(result[:7]):
-                            with st.expander(f"Evaluation {j+1}"):
-                                st.json(json.loads(response))
+                            if prompt_states[f"prompt{j+1}"]:
+                                with st.expander(f"Evaluation {j+1}"):
+                                    st.json(json.loads(response))
                         
                         with st.expander("Final Evaluation"):
-                            st.json(json.loads(result[7]))
+                            st.json(json.loads(result[-1]))
             else:
                 st.warning("Please enter an article to evaluate.")
 
@@ -733,7 +739,7 @@ def main():
                 pause_button.button("Pause Processing", on_click=pause_processing)
 
                 with st.spinner("Processing CSV..."):
-                    results = process_csv(df, course, api_key, start_row, end_row, progress_bar, stop_flag, download_button)
+                    results = process_csv(df, course, api_key, start_row, end_row, progress_bar, stop_flag, download_button, prompt_states, edited_prompts)
 
                 if stop_flag.is_set():
                     st.success("Processing paused. You can download the CSV with processed rows above.")
